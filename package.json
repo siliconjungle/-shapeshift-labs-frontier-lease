@@ -1,6 +1,6 @@
 {
   "name": "@shapeshift-labs/frontier-lease",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Runtime-neutral semantic lease manager with fencing tokens, expiry, conflict checks, and replayable evidence for Frontier collaboration.",
   "type": "module",
   "license": "MIT",

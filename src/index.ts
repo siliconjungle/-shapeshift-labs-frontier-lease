@@ -202,6 +202,75 @@ export interface FrontierSemanticLeaseFenceInput {
   now?: number;
 }
 
+export interface FrontierSemanticLeaseFenceTicket {
+  leaseId: string;
+  token: string;
+  fencingToken: number;
+  ownerId: string;
+  holderId?: string;
+  expiresAt: number;
+  scopeKeys: string[];
+}
+
+export interface FrontierSemanticLeaseCoverageInput {
+  fences: readonly FrontierSemanticLeaseFenceTicket[];
+  scopes: readonly FrontierSemanticLeaseScopeInput[];
+  now?: number;
+}
+
+export interface FrontierSemanticLeaseCoverageResult {
+  ok: boolean;
+  coveredScopeKeys: string[];
+  uncoveredScopeKeys: string[];
+  invalidFenceReasons: Record<string, string[]>;
+  conflicts: FrontierSemanticLeaseConflict[];
+}
+
+export interface FrontierSemanticLeaseApplyInput extends FrontierSemanticLeaseCoverageInput {
+  requireExclusive?: boolean;
+}
+
+export interface FrontierSemanticLeaseApplyValidation {
+  ok: boolean;
+  reasons: string[];
+  coveredScopeKeys: string[];
+  uncoveredScopeKeys: string[];
+  invalidFenceReasons: Record<string, string[]>;
+  sharedWriteScopeKeys: string[];
+  conflicts: FrontierSemanticLeaseConflict[];
+}
+
+export interface FrontierSemanticLeaseChangedPathScopeInput {
+  repository?: string;
+  packageId?: string;
+  paths: readonly string[];
+  mode?: FrontierSemanticLeaseMode;
+  metadata?: JsonObject;
+}
+
+export interface FrontierSemanticLeaseApplyEvidenceInput extends FrontierSemanticLeaseApplyInput {
+  source?: string;
+  metadata?: JsonObject;
+}
+
+export interface FrontierSemanticLeaseApplyEvidence {
+  kind: 'frontier.semantic-lease.apply-evidence';
+  version: 1;
+  source: string;
+  stateId: string;
+  generatedAt: number;
+  ok: boolean;
+  reasons: string[];
+  fenceCount: number;
+  scopeCount: number;
+  coveredScopeKeys: string[];
+  uncoveredScopeKeys: string[];
+  sharedWriteScopeKeys: string[];
+  conflictCount: number;
+  invalidFenceReasons: Record<string, string[]>;
+  metadata?: JsonObject;
+}
+
 export interface FrontierSemanticLeaseMutation {
   state: FrontierSemanticLeaseState;
   outcome: 'granted' | 'denied' | 'renewed' | 'released' | 'expired' | 'noop';
@@ -257,6 +326,26 @@ export function createSemanticLeaseState(input: FrontierSemanticLeaseStateInput 
 
 export function defineSemanticLeaseScope(input: FrontierSemanticLeaseScopeInput): FrontierSemanticLeaseScope {
   return normalizeSemanticLeaseScope(input);
+}
+
+export function defineRepositoryLeaseScope(input: Omit<FrontierSemanticLeaseScopeInput, 'kind'> = {}): FrontierSemanticLeaseScope {
+  return defineSemanticLeaseScope({ ...input, kind: 'repository' });
+}
+
+export function definePackageLeaseScope(input: Omit<FrontierSemanticLeaseScopeInput, 'kind'>): FrontierSemanticLeaseScope {
+  return defineSemanticLeaseScope({ ...input, kind: 'package' });
+}
+
+export function definePathLeaseScope(input: Omit<FrontierSemanticLeaseScopeInput, 'kind'>): FrontierSemanticLeaseScope {
+  return defineSemanticLeaseScope({ ...input, kind: 'path' });
+}
+
+export function defineExportLeaseScope(input: Omit<FrontierSemanticLeaseScopeInput, 'kind'>): FrontierSemanticLeaseScope {
+  return defineSemanticLeaseScope({ ...input, kind: 'export' });
+}
+
+export function defineMemberLeaseScope(input: Omit<FrontierSemanticLeaseScopeInput, 'kind'>): FrontierSemanticLeaseScope {
+  return defineSemanticLeaseScope({ ...input, kind: 'member' });
 }
 
 export function normalizeSemanticLeaseScope(input: FrontierSemanticLeaseScopeInput | FrontierSemanticLeaseScope): FrontierSemanticLeaseScope {
@@ -590,6 +679,134 @@ export function validateSemanticLeaseFence(
     : [];
   if (conflicts.length) reasons.push('conflicting-active-lease');
   return { ok: reasons.length === 0, lease: lease ? cloneLease(lease) : undefined, reasons: uniqueStrings(reasons), conflicts };
+}
+
+export function createSemanticLeaseFence(lease: FrontierSemanticLeaseRecord): FrontierSemanticLeaseFenceTicket {
+  return {
+    leaseId: lease.id,
+    token: lease.token,
+    fencingToken: lease.fencingToken,
+    ownerId: lease.ownerId,
+    ...(lease.holderId ? { holderId: lease.holderId } : {}),
+    expiresAt: lease.expiresAt,
+    scopeKeys: [...lease.scopeKeys]
+  };
+}
+
+export function defineChangedPathLeaseScopes(input: FrontierSemanticLeaseChangedPathScopeInput): FrontierSemanticLeaseScope[] {
+  return uniqueStrings(input.paths.map(normalizePath).filter(Boolean)).map((entry) => definePathLeaseScope({
+    repository: input.repository,
+    packageId: input.packageId,
+    path: entry,
+    mode: input.mode,
+    metadata: input.metadata
+  }));
+}
+
+export function inspectSemanticLeaseCoverage(
+  state: FrontierSemanticLeaseState,
+  input: FrontierSemanticLeaseCoverageInput
+): FrontierSemanticLeaseCoverageResult {
+  const now = timestamp(input.now);
+  const scopes = input.scopes.map(normalizeSemanticLeaseScope);
+  const coveredScopeKeys = new Set<string>();
+  const conflicts: FrontierSemanticLeaseConflict[] = [];
+  const invalidFenceReasons: Record<string, string[]> = {};
+  const validLeaseIds: string[] = [];
+  for (const fence of input.fences) {
+    const validation = validateSemanticLeaseFence(state, {
+      leaseId: fence.leaseId,
+      token: fence.token,
+      fencingToken: fence.fencingToken,
+      now
+    });
+    if (!validation.ok) invalidFenceReasons[fence.leaseId] = validation.reasons;
+    for (const conflict of validation.conflicts) conflicts.push(conflict);
+    if (!validation.lease || validation.reasons.includes('token-mismatch') || validation.reasons.includes('fencing-token-mismatch') || validation.reasons.includes('lease-inactive-or-expired')) continue;
+    validLeaseIds.push(validation.lease.id);
+    for (const scope of scopes) {
+      if (leaseCoversScope(validation.lease, scope)) coveredScopeKeys.add(scope.key);
+    }
+  }
+  for (const conflict of inspectSemanticLeaseConflicts(state, { scopes, now, excludeLeaseIds: validLeaseIds }).conflicts) conflicts.push(conflict);
+  const allScopeKeys = uniqueStrings(scopes.map((scope) => scope.key));
+  const covered = uniqueStrings(Array.from(coveredScopeKeys)).sort();
+  const uncovered = allScopeKeys.filter((key) => !coveredScopeKeys.has(key)).sort();
+  return {
+    ok: uncovered.length === 0 && Object.keys(invalidFenceReasons).length === 0 && conflicts.length === 0,
+    coveredScopeKeys: covered,
+    uncoveredScopeKeys: uncovered,
+    invalidFenceReasons,
+    conflicts
+  };
+}
+
+export function validateSemanticLeaseApply(
+  state: FrontierSemanticLeaseState,
+  input: FrontierSemanticLeaseApplyInput
+): FrontierSemanticLeaseApplyValidation {
+  const now = timestamp(input.now);
+  const scopes = input.scopes.map(normalizeSemanticLeaseScope);
+  const coverage = inspectSemanticLeaseCoverage(state, { fences: input.fences, scopes, now });
+  const sharedWriteScopeKeys = new Set<string>();
+  if (input.requireExclusive !== false) {
+    for (const fence of input.fences) {
+      const validation = validateSemanticLeaseFence(state, {
+        leaseId: fence.leaseId,
+        token: fence.token,
+        fencingToken: fence.fencingToken,
+        now
+      });
+      if (!validation.ok || !validation.lease) continue;
+      for (const scope of scopes) {
+        if (leaseCoversScope(validation.lease, scope) && validation.lease.scopes.some((held) => {
+          const singleScopeLease: FrontierSemanticLeaseRecord = { ...validation.lease!, scopes: [held], scopeKeys: [held.key] };
+          return held.mode === 'shared' && leaseCoversScope(singleScopeLease, scope);
+        })) {
+          sharedWriteScopeKeys.add(scope.key);
+        }
+      }
+    }
+  }
+  const reasons: string[] = [];
+  if (coverage.uncoveredScopeKeys.length) reasons.push('scope-not-covered-by-fence');
+  if (Object.keys(coverage.invalidFenceReasons).length) reasons.push('invalid-fence');
+  if (coverage.conflicts.length) reasons.push('conflicting-active-lease');
+  if (sharedWriteScopeKeys.size) reasons.push('shared-lease-cannot-authorize-write');
+  return {
+    ok: reasons.length === 0,
+    reasons,
+    coveredScopeKeys: coverage.coveredScopeKeys,
+    uncoveredScopeKeys: coverage.uncoveredScopeKeys,
+    invalidFenceReasons: coverage.invalidFenceReasons,
+    sharedWriteScopeKeys: Array.from(sharedWriteScopeKeys).sort(),
+    conflicts: coverage.conflicts
+  };
+}
+
+export function createSemanticLeaseApplyEvidence(
+  state: FrontierSemanticLeaseState,
+  input: FrontierSemanticLeaseApplyEvidenceInput
+): FrontierSemanticLeaseApplyEvidence {
+  const generatedAt = timestamp(input.now);
+  const validation = validateSemanticLeaseApply(state, input);
+  return stripUndefined<FrontierSemanticLeaseApplyEvidence>({
+    kind: 'frontier.semantic-lease.apply-evidence',
+    version: 1,
+    source: input.source || 'semantic-lease-apply',
+    stateId: state.id,
+    generatedAt,
+    ok: validation.ok,
+    reasons: validation.reasons,
+    fenceCount: input.fences.length,
+    scopeCount: input.scopes.length,
+    coveredScopeKeys: validation.coveredScopeKeys,
+    uncoveredScopeKeys: validation.uncoveredScopeKeys,
+    sharedWriteScopeKeys: validation.sharedWriteScopeKeys,
+    conflictCount: validation.conflicts.length,
+    invalidFenceReasons: validation.invalidFenceReasons,
+    metadata: cloneMetadata(input.metadata)
+  });
 }
 
 export function activeSemanticLeases(state: FrontierSemanticLeaseState, now: number = Date.now()): FrontierSemanticLeaseRecord[] {

@@ -2,15 +2,23 @@ import assert from 'node:assert';
 import {
   acquireSemanticLease,
   activeSemanticLeases,
+  createSemanticLeaseApplyEvidence,
+  createSemanticLeaseFence,
   createSemanticLeaseSnapshot,
   createSemanticLeaseState,
+  defineChangedPathLeaseScopes,
+  defineExportLeaseScope,
+  definePackageLeaseScope,
+  definePathLeaseScope,
   defineSemanticLeaseScope,
   expireSemanticLeases,
+  inspectSemanticLeaseCoverage,
   inspectSemanticLeaseConflicts,
   releaseSemanticLease,
   renewSemanticLease,
   replaySemanticLeaseEvents,
   semanticLeaseScopesConflict,
+  validateSemanticLeaseApply,
   validateSemanticLeaseFence
 } from '../dist/index.js';
 
@@ -141,5 +149,61 @@ const sharedB = acquireSemanticLease(sharedA.state, {
   scopes: [{ ...exportFoo, mode: 'shared' }]
 });
 assert.strictEqual(sharedB.outcome, 'granted', 'shared semantic leases should be compatible');
+
+const helperPath = definePathLeaseScope({ repository: 'repo', packageId: 'frontier-lease', path: 'src/index.ts' });
+const helperPackage = definePackageLeaseScope({ repository: 'repo', packageId: 'frontier-lease' });
+const helperExport = defineExportLeaseScope({ repository: 'repo', packageId: 'frontier-lease', path: 'src/index.ts', name: 'validateSemanticLeaseApply' });
+assert.ok(semanticLeaseScopesConflict(helperPackage, helperExport));
+assert.ok(semanticLeaseScopesConflict(helperPath, helperExport));
+
+let applyState = createSemanticLeaseState({ id: 'apply' });
+const changedScopes = defineChangedPathLeaseScopes({
+  repository: 'repo',
+  packageId: 'frontier-lease',
+  paths: ['src/index.ts', './test/smoke.mjs']
+});
+assert.deepStrictEqual(changedScopes.map((scope) => scope.path), ['src/index.ts', 'test/smoke.mjs']);
+const applyLeaseA = acquireSemanticLease(applyState, {
+  ownerId: 'apply-a',
+  now: 10,
+  scopes: [changedScopes[0]]
+});
+assert.strictEqual(applyLeaseA.outcome, 'granted');
+applyState = applyLeaseA.state;
+const applyLeaseB = acquireSemanticLease(applyState, {
+  ownerId: 'apply-b',
+  now: 11,
+  scopes: [changedScopes[1]]
+});
+assert.strictEqual(applyLeaseB.outcome, 'granted');
+applyState = applyLeaseB.state;
+const fences = [createSemanticLeaseFence(applyLeaseA.lease), createSemanticLeaseFence(applyLeaseB.lease)];
+const coverage = inspectSemanticLeaseCoverage(applyState, { fences, scopes: changedScopes, now: 12 });
+assert.strictEqual(coverage.ok, true);
+assert.deepStrictEqual(coverage.uncoveredScopeKeys, []);
+const applyValidation = validateSemanticLeaseApply(applyState, { fences, scopes: changedScopes, now: 12 });
+assert.strictEqual(applyValidation.ok, true);
+const applyEvidence = createSemanticLeaseApplyEvidence(applyState, {
+  source: 'smoke',
+  fences,
+  scopes: changedScopes,
+  now: 12
+});
+assert.strictEqual(applyEvidence.kind, 'frontier.semantic-lease.apply-evidence');
+assert.strictEqual(applyEvidence.ok, true);
+assert.strictEqual(applyEvidence.fenceCount, 2);
+
+const sharedWriteLease = acquireSemanticLease(createSemanticLeaseState({ id: 'shared-write' }), {
+  ownerId: 'reader',
+  now: 1,
+  scopes: [{ ...helperExport, mode: 'shared' }]
+});
+const sharedWrite = validateSemanticLeaseApply(sharedWriteLease.state, {
+  fences: [createSemanticLeaseFence(sharedWriteLease.lease)],
+  scopes: [helperExport],
+  now: 2
+});
+assert.strictEqual(sharedWrite.ok, false);
+assert.ok(sharedWrite.reasons.includes('shared-lease-cannot-authorize-write'));
 
 console.log('frontier lease smoke passed');
